@@ -65,7 +65,7 @@ When N1 receives this, it decrypts it, finds the routing instruction ("Go to N2"
 
 ---
 
-## 🚀 Quick Start (Docker - Recommended)
+## 🚀 Quick Start (Docker)
 
 The easiest way to see the network in action is via Docker Compose, which spins up a Directory Server and 3 distinct Relay Nodes automatically.
 
@@ -111,12 +111,6 @@ The easiest way to see the network in action is via Docker Compose, which spins 
 
 ---
 
-## 📌 Simplifications vs Tor (Production)
-If you're studying this for system security, here are the main architectural liberties taken:
-- **Telescoping Circuits:** Tor establishes circuits interactively using a Diffie-Hellman handshake at each step (Perfect Forward Secrecy). MiniTor embeds RSA keys directly in the forwarded packet.
-- **Two-Way Communication:** MiniTor is currently a one-way message push. Real Tor establishes a two-way TCP pipe.
-- **Cell Sizes:** Tor strictly pads all data into 512-byte block "Cells" to thwart traffic analysis.
-- **Directory Decentralization:** Tor uses multiple hardcoded Directory Authorities and decentralizes relay lists. 
 
 ## ⚖️ License
-MIT License. Feel free to fork, expand (e.g., adding two-way traffic or cell padding), and learn!
+MIT License. Feel free to fork, expand
