@@ -1,0 +1,34 @@
+version: '3.8'
+
+services:
+  dir-server:
+    build: .
+    command: python -m minitor.network.directory_server
+    ports:
+      - "8000:8000"
+
+  relay-1:
+    build: .
+    command: python -m minitor.network.relay_node --port 8001 --dir-host dir-server --public-host relay-1
+    depends_on:
+      - dir-server
+
+  relay-2:
+    build: .
+    command: python -m minitor.network.relay_node --port 8002 --dir-host dir-server --public-host relay-2
+    depends_on:
+      - dir-server
+
+  relay-3:
+    build: .
+    command: python -m minitor.network.relay_node --port 8003 --dir-host dir-server --public-host relay-3
+    depends_on:
+      - dir-server
+
+  # Client container isn't designed to stay alive automatically, 
+  # but can be interacted with via 'docker compose run client bash'
+  client:
+    build: .
+    command: sleep infinity
+    depends_on:
+      - dir-server
