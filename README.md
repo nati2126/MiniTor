@@ -8,9 +8,7 @@ MiniTor is a simplified, educational implementation of an anonymous network syst
 
 It implements the core mechanism of **onion routing**: layered encryption via symmetric (AES) and asymmetric (RSA) cryptography, utilizing multiple relay nodes to obfuscate the origin of a client message.
 
-> **Disclaimer:** This project is strictly for **educational and portfolio purposes**. It is *not* a production-ready anonymity network and should not be used to transmit sensitive data on public networks.
 
----
 
 ## 🏗️ Architecture
 
