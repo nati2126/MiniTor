@@ -1,8 +1,8 @@
 """
 Networking infrastructure for the MiniTor application.
 
-Contains the communication primitives:
-- Directory Server: Network consensus
-- Relay Nodes: Network routing and decryption
-- Client: Circuit building and message dispatch
+- Directory Server: network consensus (relay registration and heartbeats)
+- Relay Nodes: layer peeling, forwarding, replies, and exit policies
+- Client: circuit building and message dispatch
+- Echo Server: a demo destination for exit traffic
 """

@@ -1,34 +1,46 @@
-version: '3.8'
-
+# Starts a directory server, three relays, and a demo destination:
+#   docker compose up -d --build
+#   docker compose run --rm client
 services:
   dir-server:
     build: .
-    command: python -m minitor.network.directory_server
+    command: python -m minitor.network.directory_server --port 8000
     ports:
       - "8000:8000"
 
-  relay-1:
+  relay-1: &relay
     build: .
-    command: python -m minitor.network.relay_node --port 8001 --dir-host dir-server --public-host relay-1
+    command: >-
+      python -m minitor.network.relay_node --port 8001
+      --dir-host dir-server --public-host relay-1 --allow-exit echo-server:7000
     depends_on:
       - dir-server
+    restart: unless-stopped
 
   relay-2:
-    build: .
-    command: python -m minitor.network.relay_node --port 8002 --dir-host dir-server --public-host relay-2
-    depends_on:
-      - dir-server
+    <<: *relay
+    command: >-
+      python -m minitor.network.relay_node --port 8002
+      --dir-host dir-server --public-host relay-2 --allow-exit echo-server:7000
 
   relay-3:
-    build: .
-    command: python -m minitor.network.relay_node --port 8003 --dir-host dir-server --public-host relay-3
-    depends_on:
-      - dir-server
+    <<: *relay
+    command: >-
+      python -m minitor.network.relay_node --port 8003
+      --dir-host dir-server --public-host relay-3 --allow-exit echo-server:7000
 
-  # Client container isn't designed to stay alive automatically, 
-  # but can be interacted with via 'docker compose run client bash'
+  # A destination for exit traffic. Its replies show that it only ever sees an exit relay's address.
+  echo-server:
+    build: .
+    command: python -m minitor.network.echo_server --port 7000
+
+  # Interactive client. Only runs on demand: docker compose run --rm client
   client:
     build: .
-    command: sleep infinity
+    command: python -m minitor.network.client --dir-host dir-server
+    stdin_open: true
+    tty: true
+    profiles:
+      - client
     depends_on:
       - dir-server
