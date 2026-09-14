@@ -1,6 +1,6 @@
 """
-Cryptographic utilities for the MiniTor network.
+Cryptography for the MiniTor network.
 
-Provides a simplified interface for RSA (asymmetric) and AES (symmetric) 
-encryption operations used in the onion routing layers.
+- crypto_utils: RSA-OAEP, AES-GCM, and AES-CTR primitives
+- onion: the fixed-size cell format used to build and peel onion layers
 """

@@ -1,113 +1,202 @@
-import socket
-import json
-import random
+import argparse
 import logging
-from ..crypto.crypto_utils import generate_aes_key, rsa_encrypt, aes_encrypt
+import random
+import socket
+import sys
+from typing import Optional, Union
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - CLIENT - %(levelname)s - %(message)s')
+from ..crypto.crypto_utils import load_public_key
+from ..crypto.onion import (
+    CELL_SIZE,
+    STATUS_ERROR,
+    STATUS_TRUNCATED,
+    Hop,
+    MessageTooLargeError,
+    OnionError,
+    Reply,
+    build_onion,
+    open_reply,
+)
+from .transport import configure_logging, parse_address, recv_exact, recv_json, send_json
+
+logger = logging.getLogger(__name__)
+
+_rng = random.SystemRandom()
+
+
+class MiniTorError(Exception):
+    """Base class for client errors."""
+
+
+class DirectoryError(MiniTorError):
+    """The directory server couldn't be reached or returned a bad response."""
+
+
+class CircuitError(MiniTorError):
+    """A circuit couldn't be built or broke while carrying a message."""
+
 
 class MiniTorClient:
-    def __init__(self, dir_host='127.0.0.1', dir_port=8000):
+    def __init__(
+        self,
+        dir_host: str = "127.0.0.1",
+        dir_port: int = 8000,
+        hops: int = 3,
+        timeout: float = 30.0,
+        retries: int = 2,
+    ):
+        if hops < 1:
+            raise ValueError("A circuit needs at least one hop")
         self.dir_host = dir_host
         self.dir_port = dir_port
+        self.hops = hops
+        self.timeout = timeout
+        self.retries = retries
 
-    def get_active_relays(self):
+    def get_active_relays(self) -> list[Hop]:
         """Fetches the list of active relays from the Directory Server."""
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.connect((self.dir_host, self.dir_port))
-            req = {'type': 'GET_RELAYS'}
-            s.send(json.dumps(req).encode('utf-8'))
-            data = s.recv(65536).decode('utf-8')
-            s.close()
-            return json.loads(data)
-        except Exception as e:
-            logging.error(f"Failed to connect to Directory Server: {e}")
-            return []
+            with socket.create_connection((self.dir_host, self.dir_port), timeout=self.timeout) as s:
+                send_json(s, {"type": "GET_RELAYS"})
+                response = recv_json(s)
+        except (OSError, ValueError) as e:
+            raise DirectoryError(f"Could not query directory {self.dir_host}:{self.dir_port}: {e}") from e
 
-    def build_circuit(self, relays, length=3):
-        """Randomly selects 'length' distinct relays to form a circuit."""
-        if len(relays) < length:
-            raise ValueError(f"Not enough relays to build circuit. Need {length}, got {len(relays)}.")
-        return random.sample(relays, length)
+        if not isinstance(response, dict) or not response.get("ok") or not isinstance(response.get("relays"), list):
+            raise DirectoryError(f"Unexpected directory response: {response!r}")
 
-    def send_message(self, message: str):
-        """Onion encrypts and sends a message through the network."""
-        relays = self.get_active_relays()
-        if not relays:
-            logging.warning("No relays available on the network.")
-            return
+        relays = []
+        for entry in response["relays"]:
+            try:
+                relays.append(Hop(entry["host"], int(entry["port"]), load_public_key(entry["pub_key"])))
+            except (KeyError, TypeError, ValueError) as e:
+                logger.warning("Ignoring invalid relay entry from directory: %s", e)
+        return relays
+
+    def build_circuit(self, relays: list[Hop]) -> list[Hop]:
+        """Randomly selects distinct relays for a circuit (entry first, exit last)."""
+        if len(relays) < self.hops:
+            raise CircuitError(
+                f"Not enough relays to build a {self.hops}-hop circuit: the directory lists {len(relays)}"
+            )
+        return _rng.sample(relays, self.hops)
+
+    def send_message(
+        self,
+        message: Union[str, bytes],
+        destination: Optional[tuple[str, int]] = None,
+    ) -> Reply:
+        """
+        Onion-encrypts a message, sends it through a fresh circuit, and returns
+        the exit node's verified reply. With a destination, the exit node
+        forwards the message there and relays back the response.
+
+        If a circuit breaks (for example a relay went offline but hasn't expired
+        from the directory yet), a new circuit is tried up to `retries` times.
+        """
+        if isinstance(message, str):
+            message = message.encode("utf-8")
+
+        last_error: Optional[CircuitError] = None
+        for attempt in range(1 + self.retries):
+            if attempt:
+                logger.warning("Retrying with a new circuit (attempt %d of %d)", attempt + 1, 1 + self.retries)
+            circuit = self.build_circuit(self.get_active_relays())
+            try:
+                return self._send_over_circuit(circuit, message, destination)
+            except CircuitError as e:
+                logger.warning("%s", e)
+                last_error = e
+        assert last_error is not None
+        raise last_error
+
+    def _send_over_circuit(self, circuit: list[Hop], message: bytes, destination: Optional[tuple[str, int]]) -> Reply:
+        logger.info("Built circuit:")
+        for idx, hop in enumerate(circuit):
+            role = "Entry" if idx == 0 else "Exit" if idx == len(circuit) - 1 else "Middle"
+            logger.info("  [%s] %s:%s", role, hop.host, hop.port)
+
+        cell, keys = build_onion(circuit, message, destination)
+        entry = circuit[0]
+        logger.info("Sending %d-byte onion cell to entry node %s:%s", CELL_SIZE, entry.host, entry.port)
+        try:
+            with socket.create_connection((entry.host, entry.port), timeout=self.timeout) as s:
+                s.sendall(cell)
+                reply_cell = recv_exact(s, CELL_SIZE)
+        except OSError as e:
+            raise CircuitError(f"Circuit via entry {entry.host}:{entry.port} failed: {e}") from e
 
         try:
-            # We usually use 3 nodes: Entry -> Middle -> Exit
-            circuit_length = min(3, len(relays))
-            circuit = self.build_circuit(relays, length=circuit_length)
-            
-            logging.info("Built Circuit:")
-            for idx, r in enumerate(circuit):
-                role = "Entry" if idx == 0 else "Exit" if idx == len(circuit) -1 else "Middle"
-                logging.info(f" [{role}] -> {r['host']}:{r['port']}")
-                
-            # --- ONION CREATION (Iterative Encryption from Exit back to Entry) ---
-            
-            # Start with the core representing the final destination payload.
-            # Format: next_host_len (4) | next_host | next_port (4) | payload
-            # For the exit node, next_host_len = 0 signifies they are the end of the line.
-            payload = (0).to_bytes(4, 'big') + message.encode('utf-8')
-            
-            for i in range(len(circuit) - 1, -1, -1):
-                relay = circuit[i]
-                
-                # 1. Generate a new symmetric Session Key for this layer
-                session_key = generate_aes_key()
-                pub_key = relay['pub_key'].encode('utf-8')
-                
-                # 2. Encrypt the payload with AES
-                aes_ciphertext = aes_encrypt(session_key, payload)
-                
-                # 3. Encrypt the AES Session Key with the Relay's RSA Public Key
-                encrypted_session_key = rsa_encrypt(pub_key, session_key)
-                
-                # 4. Construct the layer block for THIS relay
-                rsa_len = len(encrypted_session_key)
-                block = rsa_len.to_bytes(4, 'big') + encrypted_session_key + aes_ciphertext
-                
-                # 5. Unless this is the Entry node, prepare the payload for the PREVIOUS relay.
-                if i > 0:
-                    host_bytes = relay['host'].encode('utf-8')
-                    host_len = len(host_bytes)
-                    next_port = relay['port']
-                    
-                    # Prepend where the previous node should send this block
-                    payload = host_len.to_bytes(4, 'big') + host_bytes + next_port.to_bytes(4, 'big') + block
-                    
-            # The final `block` is the fully constructed Onion. Send it to the Entry Node!
-            entry_node = circuit[0]
-            logging.info(f"Dispatching Onion to Entry Node {entry_node['host']}:{entry_node['port']}")
-            
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.connect((entry_node['host'], entry_node['port']))
-            s.send(block)
-            s.close()
-            logging.info("Message dispatched successfully!")
-            
-        except Exception as e:
-            logging.error(f"Failed to send message: {e}")
+            reply = open_reply(keys, reply_cell)
+        except OnionError as e:
+            raise CircuitError(str(e)) from e
+        logger.info("Received and verified reply from the exit node")
+        return reply
 
-if __name__ == "__main__":
-    import argparse
+
+def _print_reply(reply: Reply) -> None:
+    text = reply.data.decode("utf-8", errors="replace")
+    if reply.status == STATUS_ERROR:
+        print(f"Exit node reported an error: {text}")
+    else:
+        print(f"Reply: {text}")
+        if reply.status == STATUS_TRUNCATED:
+            print("(reply was truncated to fit in one cell)")
+
+
+def main(argv=None) -> None:
     parser = argparse.ArgumentParser(description="MiniTor Client")
-    parser.add_argument('--dir-host', type=str, default='127.0.0.1', help='Directory Server host')
-    parser.add_argument('--dir-port', type=int, default=8000, help='Directory Server port')
-    args = parser.parse_args()
+    parser.add_argument("--dir-host", default="127.0.0.1", help="Directory Server host")
+    parser.add_argument("--dir-port", type=int, default=8000, help="Directory Server port")
+    parser.add_argument("--hops", type=int, default=3, help="Number of relays in the circuit (default: 3)")
+    parser.add_argument(
+        "--dest",
+        metavar="HOST:PORT",
+        help="Have the exit node forward the message to this destination (must be allowed by its exit policy)",
+    )
+    parser.add_argument("-m", "--message", help="Send one message and exit instead of prompting")
+    parser.add_argument("--timeout", type=float, default=30.0, help="Network timeout in seconds (default: 30)")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
 
-    client = MiniTorClient(dir_host=args.dir_host, dir_port=args.dir_port)
-    logging.info(f"Client initialized. Directory Server: {args.dir_host}:{args.dir_port}")
+    configure_logging("CLIENT", args.verbose)
+    destination = None
+    if args.dest:
+        try:
+            destination = parse_address(args.dest)
+        except ValueError as e:
+            parser.error(str(e))
+    if args.hops < 3:
+        logger.warning("Circuits with fewer than 3 hops give much weaker anonymity")
+
+    try:
+        client = MiniTorClient(args.dir_host, args.dir_port, hops=args.hops, timeout=args.timeout)
+    except ValueError as e:
+        parser.error(str(e))
+
+    def send(msg: str) -> bool:
+        try:
+            _print_reply(client.send_message(msg, destination))
+            return True
+        except (MiniTorError, MessageTooLargeError) as e:
+            logger.error("%s", e)
+            return False
+
+    if args.message is not None:
+        sys.exit(0 if send(args.message) else 1)
+
+    logger.info("Client ready. Directory Server: %s:%s", args.dir_host, args.dir_port)
     while True:
         try:
             msg = input("\nEnter a secret message to send (or 'q' to quit): ")
-            if msg.lower() == 'q':
-                break
-            client.send_message(msg)
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, EOFError):
+            print()
             break
+        if msg.strip().lower() == "q":
+            break
+        if msg:
+            send(msg)
+
+
+if __name__ == "__main__":
+    main()

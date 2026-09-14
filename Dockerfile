@@ -1,12 +1,16 @@
-FROM python:3.10-slim
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app
 
 WORKDIR /app
 
-# Install dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application files
-COPY . .
+COPY minitor ./minitor
 
-ENV PYTHONPATH=/app
+# Relays don't need root.
+RUN useradd --create-home --uid 10001 minitor
+USER minitor
