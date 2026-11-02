@@ -1,8 +1,10 @@
 """
-Networking infrastructure for the MiniTor application.
+The MiniTor nodes.
 
-- Directory Server: network consensus (relay registration and heartbeats)
-- Relay Nodes: layer peeling, forwarding, replies, and exit policies
-- Client: circuit building and message dispatch
-- Echo Server: a demo destination for exit traffic
+- directory_server: signed consensus and hidden-service descriptors
+- relay_node: relays (forwarding, exits, introduction and rendezvous points)
+- client: circuits, streams, and the command-line client
+- socks: a SOCKS5 proxy in front of the client
+- hidden_service: hosting a .onion service
+- echo_server: a demo destination
 """

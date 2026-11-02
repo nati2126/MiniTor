@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MiniTor Live</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --text: #1d2330; --muted: #677089; --line: #d7dbe3;
+    --relay: #6d4fd8; --client: #1f8a5b; --service: #c2410c; --other: #677089;
+    --create: #d99a00; --relay-cell: #2563eb; --destroy: #dc2626;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0f1218; --panel: #171b24; --text: #e6e9f0; --muted: #8b93a7; --line: #2a3140;
+      --relay: #9a82ff; --client: #3ccf8e; --service: #fb8b4b; --other: #8b93a7;
+      --create: #f5c242; --relay-cell: #5b9bff; --destroy: #ff5f5f;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0f1218; --panel: #171b24; --text: #e6e9f0; --muted: #8b93a7; --line: #2a3140;
+    --relay: #9a82ff; --client: #3ccf8e; --service: #fb8b4b; --other: #8b93a7;
+    --create: #f5c242; --relay-cell: #5b9bff; --destroy: #ff5f5f;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { padding: 16px 20px 8px; display: flex; flex-wrap: wrap; gap: 8px 20px; align-items: baseline; }
+  h1 { margin: 0; font-size: 20px; letter-spacing: -0.01em; }
+  .status { color: var(--muted); font-size: 13px; }
+  .status b { color: var(--text); font-variant-numeric: tabular-nums; }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 16px; padding: 8px 20px 20px; }
+  @media (max-width: 860px) { main { grid-template-columns: 1fr; padding: 8px 16px 16px; } header { padding: 16px 16px 8px; } }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
+  #stage { width: 100%; height: auto; display: block; aspect-ratio: 10 / 6; }
+  .side { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+  .side .card { padding: 14px 16px; }
+  h2 { margin: 0 0 8px; font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+  .legend { display: grid; grid-template-columns: auto 1fr; gap: 6px 10px; align-items: center; font-size: 13px; }
+  .dot { width: 12px; height: 12px; border-radius: 50%; display: inline-block; }
+  .note { font-size: 13px; color: var(--muted); margin: 0; }
+  #log { list-style: none; margin: 0; padding: 0; max-height: 320px; overflow-y: auto; font-size: 12.5px; }
+  #log li { padding: 5px 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+  #log li:last-child { border-bottom: 0; }
+  #log .who { color: var(--muted); }
+  .empty { fill: var(--muted); font-size: 15px; }
+  .label { fill: var(--text); font-size: 12px; }
+  .role { fill: var(--muted); font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.06em; }
+  .link { stroke: var(--line); stroke-width: 2; transition: stroke 0.6s, stroke-width 0.6s; }
+  .link.active { stroke: var(--relay-cell); stroke-width: 3; }
+</style>
+</head>
+<body>
+<header>
+  <h1>MiniTor Live</h1>
+  <span class="status" id="status">connecting…</span>
+</header>
+<main>
+  <div class="card">
+    <svg id="stage" viewBox="0 0 1000 600" role="img" aria-label="Animated map of MiniTor nodes and the cells moving between them">
+      <g id="links"></g><g id="cells"></g><g id="nodes"></g>
+      <text id="empty" class="empty" x="500" y="300" text-anchor="middle">Waiting for nodes… start them with --viz HOST:9999</text>
+    </svg>
+  </div>
+  <div class="side">
+    <section class="card">
+      <h2>Legend</h2>
+      <div class="legend">
+        <span class="dot" style="background:var(--client)"></span><span>Client</span>
+        <span class="dot" style="background:var(--relay)"></span><span>Relay</span>
+        <span class="dot" style="background:var(--service)"></span><span>Hidden service</span>
+        <span class="dot" style="background:var(--create)"></span><span>CREATE / CREATED cell (handshake)</span>
+        <span class="dot" style="background:var(--relay-cell)"></span><span>RELAY cell (encrypted data)</span>
+        <span class="dot" style="background:var(--destroy)"></span><span>DESTROY cell</span>
+      </div>
+    </section>
+    <section class="card">
+      <h2>What you're seeing</h2>
+      <p class="note">Each node reports only its own links: a relay knows the hop before it and the hop after it, nothing more.
+        This page combines every node's view, which is what a <em>global passive adversary</em> watching all links could do.
+        Matching cell timing across links reveals whole paths. Tor doesn't protect against that adversary, and neither does MiniTor.</p>
+    </section>
+    <section class="card">
+      <h2>Events</h2>
+      <ul id="log"></ul>
+    </section>
+  </div>
+</main>
+<script>
+(() => {
+  const NS = "http://www.w3.org/2000/svg";
+  const W = 1000, H = 600, MAX_DOTS = 250, DOT_MS = 650;
+  const nodes = new Map();   // name -> {name, role, x, y, el}
+  const links = new Map();   // id -> {a, b, el}
+  const gNodes = document.getElementById("nodes");
+  const gLinks = document.getElementById("links");
+  const gCells = document.getElementById("cells");
+  const empty = document.getElementById("empty");
+  const statusEl = document.getElementById("status");
+  const logEl = document.getElementById("log");
+  let cellTimes = [], circuits = 0, dots = 0;
+
+  const roleColor = r => ({relay: "var(--relay)", client: "var(--client)", service: "var(--service)"}[r] || "var(--other)");
+  const cellColor = c => c === "RELAY" ? "var(--relay-cell)" : c === "DESTROY" ? "var(--destroy)" : "var(--create)";
+  const short = s => s.length > 22 ? s.slice(0, 20) + "…" : s;
+
+  function layout() {
+    const by = {client: [], relay: [], service: [], other: []};
+    [...nodes.values()].sort((a, b) => a.name.localeCompare(b.name))
+      .forEach(n => (by[n.role] || by.other).push(n));
+    const column = (list, x) => list.forEach((n, i) => { n.x = x; n.y = H * (i + 1) / (list.length + 1); });
+    column(by.client, 90);
+    column(by.service.concat(by.other), W - 90);
+    by.relay.forEach((n, i) => {
+      const a = -Math.PI / 2 + 2 * Math.PI * i / Math.max(by.relay.length, 1);
+      n.x = W / 2 + 240 * Math.cos(a); n.y = H / 2 + 215 * Math.sin(a);
+    });
+    for (const n of nodes.values()) n.el.setAttribute("transform", `translate(${n.x.toFixed(1)},${n.y.toFixed(1)})`);
+    for (const l of links.values()) placeLink(l);
+    empty.style.display = nodes.size ? "none" : "";
+  }
+
+  function addNode(name, role) {
+    if (nodes.has(name)) return;
+    const el = document.createElementNS(NS, "g");
+    el.innerHTML = `<circle r="22" fill="${roleColor(role)}" opacity="0.9"></circle>
+      <text class="role" y="-30" text-anchor="middle"></text><text class="label" y="40" text-anchor="middle"></text>`;
+    el.querySelector(".role").textContent = role === "service" ? "hidden service" : role;
+    el.querySelector(".label").textContent = short(name);
+    const t = document.createElementNS(NS, "title"); t.textContent = name; el.appendChild(t);
+    gNodes.appendChild(el);
+    nodes.set(name, {name, role, x: W / 2, y: H / 2, el});
+    layout();
+  }
+
+  function removeNode(name) {
+    const n = nodes.get(name); if (!n) return;
+    n.el.remove(); nodes.delete(name);
+    for (const [id, l] of links) if (l.a === name || l.b === name) { l.el.remove(); links.delete(id); }
+    layout();
+  }
+
+  function placeLink(l) {
+    const a = nodes.get(l.a), b = nodes.get(l.b); if (!a || !b) return;
+    l.el.setAttribute("x1", a.x); l.el.setAttribute("y1", a.y);
+    l.el.setAttribute("x2", b.x); l.el.setAttribute("y2", b.y);
+  }
+
+  function addLink(id, a, b) {
+    if (links.has(id) || !nodes.has(a) || !nodes.has(b)) return;
+    const el = document.createElementNS(NS, "line"); el.setAttribute("class", "link");
+    gLinks.appendChild(el);
+    const l = {a, b, el}; links.set(id, l); placeLink(l);
+  }
+
+  function animateCell(from, to, command) {
+    cellTimes.push(performance.now());
+    const a = nodes.get(from), b = nodes.get(to);
+    if (!a || !b || dots >= MAX_DOTS) return;
+    for (const l of links.values()) {
+      if ((l.a === from && l.b === to) || (l.a === to && l.b === from)) {
+        l.el.classList.add("active"); clearTimeout(l.timer);
+        l.timer = setTimeout(() => l.el.classList.remove("active"), 900);
+      }
+    }
+    const dot = document.createElementNS(NS, "circle");
+    dot.setAttribute("r", command === "RELAY" ? 5 : 7);
+    dot.setAttribute("fill", cellColor(command));
+    gCells.appendChild(dot); dots++;
+    const start = performance.now();
+    const step = now => {
+      const t = Math.min((now - start) / DOT_MS, 1), e = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+      dot.setAttribute("cx", a.x + (b.x - a.x) * e); dot.setAttribute("cy", a.y + (b.y - a.y) * e);
+      if (t < 1) requestAnimationFrame(step); else { dot.remove(); dots--; }
+    };
+    requestAnimationFrame(step);
+  }
+
+  function log(who, message) {
+    if (message.startsWith("built circuit")) circuits++;
+    const li = document.createElement("li");
+    const w = document.createElement("span"); w.className = "who"; w.textContent = short(who) + " · ";
+    li.appendChild(w); li.appendChild(document.createTextNode(message));
+    logEl.prepend(li);
+    while (logEl.children.length > 200) logEl.lastChild.remove();
+  }
+
+  function render() {
+    const now = performance.now();
+    cellTimes = cellTimes.filter(t => now - t < 1000);
+    const relays = [...nodes.values()].filter(n => n.role === "relay").length;
+    statusEl.innerHTML = `<b>${relays}</b> relays · <b>${nodes.size - relays}</b> other nodes · ` +
+      `<b>${links.size}</b> links · <b>${circuits}</b> circuits built · <b>${cellTimes.length}</b> cells/s`;
+  }
+  setInterval(render, 500);
+
+  function handle(ev) {
+    switch (ev.type) {
+      case "snapshot":
+        [...nodes.keys()].forEach(removeNode);
+        ev.nodes.forEach(n => addNode(n.name, n.role));
+        ev.links.forEach(l => addLink(l.id, l.a, l.b));
+        break;
+      case "node": addNode(ev.name, ev.role); break;
+      case "node_gone": removeNode(ev.name); break;
+      case "link": addLink(ev.id, ev.a, ev.b); break;
+      case "link_closed": { const l = links.get(ev.id); if (l) { l.el.remove(); links.delete(ev.id); } break; }
+      case "cell": animateCell(ev.from, ev.to, ev.command); break;
+      case "log": log(ev.node, ev.message); break;
+    }
+  }
+
+  const source = new EventSource("events");
+  source.onmessage = e => { try { handle(JSON.parse(e.data)); } catch (err) { console.warn(err); } };
+  source.onerror = () => { statusEl.textContent = "disconnected, retrying…"; };
+  render();
+})();
+</script>
+</body>
+</html>

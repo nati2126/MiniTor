@@ -1,48 +1,21 @@
 """
-End-to-end tests: a real directory server, relay nodes, and echo server run
+End-to-end tests: a real directory server, relays, and echo server run
 in-process on ephemeral ports and the real client sends traffic through them.
 """
 
+import os
 import socket
-from contextlib import contextmanager
-from types import SimpleNamespace
+import threading
 
 import pytest
+from conftest import LOCALHOST, running_network
 
-from minitor.crypto.onion import CELL_SIZE, STATUS_ERROR, STATUS_OK, build_onion, open_reply
-from minitor.network.client import CircuitError, DirectoryError, MiniTorClient
-from minitor.network.directory_server import DirectoryServer
-from minitor.network.echo_server import EchoServer
-from minitor.network.relay_node import ExitPolicy, RelayNode
-from minitor.network.transport import recv_exact
-
-LOCALHOST = "127.0.0.1"
-
-
-@contextmanager
-def running_network(relay_count=3):
-    directory = DirectoryServer(LOCALHOST, 0).start()
-    echo = EchoServer(LOCALHOST, 0).start()
-    delivered = []
-    relays = []
-    try:
-        for _ in range(relay_count):
-            relay = RelayNode(
-                host=LOCALHOST,
-                port=0,
-                dir_port=directory.port,
-                public_host=LOCALHOST,
-                exit_policy=ExitPolicy([f"{LOCALHOST}:{echo.port}"]),
-                timeout=10,
-                exit_handler=lambda message: delivered.append(message) or b"delivered",
-            )
-            relays.append(relay.start())
-        for relay in relays:
-            assert relay.registered.wait(10), "relay did not register with the directory"
-        yield SimpleNamespace(directory=directory, echo=echo, relays=relays, delivered=delivered)
-    finally:
-        for server in [*relays, echo, directory]:
-            server.stop()
+from minitor.network.client import MiniTorClient
+from minitor.network.descriptors import DirectoryError
+from minitor.network.relay_node import RelayNode
+from minitor.protocol.cells import EndReason, LinkSpec, RelayCommand, RelayMessage
+from minitor.protocol.circuit import CircuitError, build_circuit
+from minitor.protocol.stream import STREAM_WINDOW, StreamError
 
 
 @pytest.fixture(scope="module")
@@ -53,36 +26,92 @@ def network():
 
 @pytest.fixture
 def client(network):
-    return MiniTorClient(LOCALHOST, network.directory.port, timeout=10, retries=0)
+    c = network.client()
+    yield c
+    c.close()
 
 
 def test_message_reaches_exit_and_reply_comes_back(network, client):
     network.delivered.clear()
-    reply = client.send_message("Hello from MiniTor! This message was onion-routed.")
-    assert (reply.status, reply.data) == (STATUS_OK, b"delivered")
-    assert network.delivered == [b"Hello from MiniTor! This message was onion-routed."]
+    assert client.send_message("Hello from MiniTor!") == b"delivered"
+    assert network.delivered == [b"Hello from MiniTor!"]
 
 
-def test_unicode_message(network, client):
+def test_circuit_is_reused_for_later_messages(network, client):
+    client.send_message("one")
+    first = client.get_circuit()
+    client.send_message("two")
+    assert client.get_circuit() is first
+    assert len(first.hops) == 3
+
+
+def test_unicode_and_empty_messages(network, client):
     network.delivered.clear()
     client.send_message("Selam! ሰላም 🧅")
-    assert network.delivered == ["Selam! ሰላም 🧅".encode("utf-8")]
+    client.send_message("")
+    assert network.delivered == ["Selam! ሰላም 🧅".encode(), b""]
 
 
-def test_exit_forwards_to_allowed_destination(network, client):
+def test_stream_to_destination_through_exit(network, client):
     reply = client.send_message("ping", destination=(LOCALHOST, network.echo.port))
-    assert reply.status == STATUS_OK
-    assert reply.data.endswith(b"You said: ping")
+    assert reply == b"[echo-server] Your connection came from 127.0.0.1. You said: ping"
 
 
-def test_exit_policy_blocks_other_destinations(network, client):
-    reply = client.send_message("ping", destination=(LOCALHOST, network.directory.port))
-    assert reply.status == STATUS_ERROR
-    assert b"Exit policy does not allow" in reply.data
+def test_large_transfer_uses_many_cells_and_flow_control(network, client):
+    # Far more than the 500-cell window in each direction, so SENDMEs must flow.
+    payload = os.urandom(STREAM_WINDOW * 484 * 2)
+    reply = client.send_message(payload, destination=(LOCALHOST, network.echo.port))
+    assert reply.endswith(payload)
+
+
+def test_concurrent_streams_share_one_circuit(network, client):
+    results = {}
+
+    def worker(i):
+        results[i] = client.send_message(f"stream {i}", destination=(LOCALHOST, network.echo.port))
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(5)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(30)
+    assert all(results[i].endswith(f"stream {i}".encode()) for i in range(5))
+
+
+def test_client_refuses_destination_no_exit_allows(network, client):
+    with pytest.raises(StreamError) as info:
+        client.send_message("ping", destination=(LOCALHOST, network.directory.port))
+    assert info.value.reason == EndReason.EXITPOLICY
+
+
+def test_exit_enforces_its_policy(network, client):
+    circuit = client.get_circuit()
+    with pytest.raises(StreamError) as info:
+        circuit.open_stream(LOCALHOST, network.directory.port)
+    assert info.value.reason == EndReason.EXITPOLICY
+    assert "does not allow" in info.value.message
+    assert not circuit.closed  # A refused stream doesn't break the circuit.
+
+
+def test_stream_to_closed_port_is_refused(network, client):
+    with socket.socket() as s:
+        s.bind((LOCALHOST, 0))
+        closed_port = s.getsockname()[1]
+    circuit = client.get_circuit()
+    # Allowed by no policy, so ask a relay whose policy we override for this test.
+    exit_relay = next(r for r in network.relays if r.port == circuit.hops[-1].spec.port)
+    original = exit_relay.exit_policy
+    exit_relay.exit_policy = type(original)([f"{LOCALHOST}:{closed_port}"])
+    try:
+        with pytest.raises(StreamError) as info:
+            circuit.open_stream(LOCALHOST, closed_port)
+        assert info.value.reason == EndReason.CONNECTREFUSED
+    finally:
+        exit_relay.exit_policy = original
 
 
 def test_not_enough_relays(network):
-    client = MiniTorClient(LOCALHOST, network.directory.port, hops=4)
+    client = network.client(hops=4)
     with pytest.raises(CircuitError, match="Not enough relays"):
         client.send_message("hi")
 
@@ -92,36 +121,77 @@ def test_directory_unreachable():
         s.bind((LOCALHOST, 0))
         unused_port = s.getsockname()[1]
     with pytest.raises(DirectoryError):
-        MiniTorClient(LOCALHOST, unused_port, timeout=5).send_message("hi")
+        MiniTorClient(LOCALHOST, unused_port, timeout=2).send_message("hi")
 
 
-def test_replayed_cell_is_dropped(network, client):
-    circuit = client.build_circuit(client.get_active_relays())
-    cell, keys = build_onion(circuit, b"once only")
-    entry = (circuit[0].host, circuit[0].port)
-
-    with socket.create_connection(entry, timeout=10) as s:
-        s.sendall(cell)
-        assert open_reply(keys, recv_exact(s, CELL_SIZE)).ok
-
-    with socket.create_connection(entry, timeout=10) as s:
-        s.sendall(cell)
-        with pytest.raises(OSError):
-            recv_exact(s, CELL_SIZE)
+def test_relays_only_extend_to_relays_in_the_consensus(network, client):
+    entry = network.relays[0].link_spec
+    impostor = LinkSpec(LOCALHOST, network.echo.port, os.urandom(32), os.urandom(32))
+    with pytest.raises(CircuitError):
+        build_circuit(client.channels, [entry, impostor], timeout=5)
 
 
-def test_client_retries_with_new_circuit_when_relay_is_down():
+def test_relay_rejects_handshake_for_the_wrong_onion_key(network, client):
+    relay = network.relays[0].link_spec
+    wrong = LinkSpec(relay.host, relay.port, relay.identity, os.urandom(32))
+    with pytest.raises(CircuitError):
+        build_circuit(client.channels, [wrong], timeout=5)
+
+
+def test_closing_a_circuit_ends_its_streams(network, client):
+    circuit = client.get_circuit()
+    stream = circuit.open_stream(LOCALHOST, network.echo.port)
+    circuit.close()
+    with pytest.raises(StreamError):
+        stream.read()
+    with pytest.raises(CircuitError):
+        circuit.send(RelayMessage(RelayCommand.DATA, 1, b"x"))
+
+
+class TamperingRelay(RelayNode):
+    """A malicious relay that flips a bit in every cell it forwards once `tamper` is set."""
+
+    tamper = False
+
+    def _handle_forward(self, circuit, body):
+        if self.tamper:
+            body = bytes([body[0] ^ 1]) + body[1:]
+        super()._handle_forward(circuit, body)
+
+
+def test_tampering_by_a_relay_destroys_the_circuit():
+    with running_network(relay_class=TamperingRelay) as net:
+        client = net.client()
+        circuit = client.get_circuit()
+        entry = next(r for r in net.relays if r.port == circuit.hops[0].spec.port)
+        entry.tamper = True
+        with pytest.raises((StreamError, CircuitError)):
+            stream = circuit.open_stream("", 0, timeout=5)
+            stream.write(b"never delivered")
+            stream.shutdown_write()
+            stream.read_all()
+        # The exit couldn't recognize the altered cell, so it tore the circuit down.
+        assert circuit.closed
+        assert "destroyed" in circuit.close_reason
+        assert net.delivered == []
+        client.close()
+
+
+def test_client_retries_with_new_path_when_relay_is_down():
     with running_network(relay_count=4) as net:
-        client = MiniTorClient(LOCALHOST, net.directory.port, timeout=10, retries=1)
+        client = net.client(retries=1)
         relays = client.get_active_relays()
-        dead_port = net.relays[0].port
-        net.relays[0].stop()  # still listed until its directory entry expires
+        dead = next(r for r in relays if r.port == net.relays[0].port)
+        net.relays[0].stop()  # Still listed until its directory entry expires.
+        alive = [r for r in relays if r is not dead]
+        paths = iter(
+            [
+                [alive[0].link_spec, dead.link_spec, alive[1].link_spec],
+                [r.link_spec for r in alive],
+            ]
+        )
+        client.choose_path = lambda *args, **kwargs: next(paths)
 
-        dead = next(r for r in relays if r.port == dead_port)
-        alive = [r for r in relays if r.port != dead_port]
-        circuits = iter([[alive[0], dead, alive[1]], alive])
-        client.build_circuit = lambda _relays: next(circuits)
-
-        reply = client.send_message("still gets through")
-        assert reply.ok
+        assert client.send_message("still gets through") == b"delivered"
         assert net.delivered == [b"still gets through"]
+        client.close()

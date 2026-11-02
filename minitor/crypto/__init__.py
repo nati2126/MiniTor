@@ -1,6 +1,7 @@
 """
 Cryptography for the MiniTor network.
 
-- crypto_utils: RSA-OAEP, AES-GCM, and AES-CTR primitives
-- onion: the fixed-size cell format used to build and peel onion layers
+- crypto_utils: Ed25519, X25519, HKDF/HMAC, AES-CTR, AES-GCM, onion addresses
+- handshake: the ntor handshake that creates each hop of a circuit
+- onion: per-hop layer encryption and recognition of relay cells
 """

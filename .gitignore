@@ -31,3 +31,6 @@ htmlcov/
 
 # Docker
 .docker/
+.ruff_cache/
+.mypy_cache/
+coverage.xml

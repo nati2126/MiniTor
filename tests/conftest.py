@@ -1,24 +1,63 @@
+import time
+from contextlib import contextmanager
+from types import SimpleNamespace
+
 import pytest
 
-from minitor.crypto.crypto_utils import generate_rsa_keypair, load_private_key, load_public_key
-from minitor.crypto.onion import Hop
+from minitor.network.client import MiniTorClient
+from minitor.network.directory_server import DirectoryServer
+from minitor.network.echo_server import EchoServer
+from minitor.network.exit_policy import ExitPolicy
+from minitor.network.relay_node import RelayNode
+
+LOCALHOST = "127.0.0.1"
 
 
-@pytest.fixture(scope="session")
-def keypairs():
-    """Three RSA key pairs, generated once because key generation is slow."""
-    pairs = []
-    for _ in range(3):
-        private_pem, public_pem = generate_rsa_keypair()
-        pairs.append((load_private_key(private_pem), load_public_key(public_pem)))
-    return pairs
+class FakeClock:
+    def __init__(self, now: float | None = None):
+        self.now = time.time() if now is None else now
 
-
-@pytest.fixture(scope="session")
-def public_pem():
-    return generate_rsa_keypair()[1].decode("utf-8")
+    def __call__(self) -> float:
+        return self.now
 
 
 @pytest.fixture
-def circuit(keypairs):
-    return [Hop("127.0.0.1", 9001 + i, public_key) for i, (_, public_key) in enumerate(keypairs)]
+def clock():
+    return FakeClock()
+
+
+@contextmanager
+def running_network(relay_count=3, relay_class=RelayNode, extra_exit_rules=()):
+    """A directory, `relay_count` relays, and an echo server on ephemeral local ports."""
+    directory = DirectoryServer(LOCALHOST, 0).start()
+    echo = EchoServer(LOCALHOST, 0).start()
+    delivered: list[bytes] = []
+    relays = []
+    key = directory.public_key.hex()
+    try:
+        for _ in range(relay_count):
+            relay = relay_class(
+                host=LOCALHOST,
+                port=0,
+                dir_port=directory.port,
+                public_host=LOCALHOST,
+                exit_policy=ExitPolicy([f"{LOCALHOST}:{echo.port}", *extra_exit_rules]),
+                timeout=10,
+                exit_handler=lambda message: delivered.append(message) or b"delivered",
+                directory_key=key,
+            )
+            relays.append(relay.start())
+        for relay in relays:
+            assert relay.registered.wait(10), "relay did not register with the directory"
+
+        def make_client(**kwargs):
+            kwargs.setdefault("timeout", 10)
+            kwargs.setdefault("retries", 0)
+            return MiniTorClient(LOCALHOST, directory.port, directory_key=key, **kwargs)
+
+        yield SimpleNamespace(
+            directory=directory, echo=echo, relays=relays, delivered=delivered, key=key, client=make_client
+        )
+    finally:
+        for server in [*relays, echo, directory]:
+            server.stop()

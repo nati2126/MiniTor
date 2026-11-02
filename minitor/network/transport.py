@@ -10,7 +10,7 @@ import socket
 import socketserver
 import sys
 import threading
-from typing import Any, Optional
+from typing import Any
 
 MAX_FRAME_SIZE = 1024 * 1024  # 1 MiB
 _FRAME_HEADER_SIZE = 4
@@ -102,11 +102,11 @@ class BackgroundServer:
                     )
 
         self._server = _ThreadingTCPServer((host, port), _Handler)
-        self._thread: Optional[threading.Thread] = None
+        self._thread: threading.Thread | None = None
 
     @property
     def host(self) -> str:
-        return self._server.server_address[0]
+        return str(self._server.server_address[0])
 
     @property
     def port(self) -> int:
