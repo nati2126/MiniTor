@@ -1,194 +1,94 @@
-# MiniTor: A Python-Based Onion Routing Simulation
+# MiniTor
 
 [![Tests](https://github.com/nati2126/MiniTor/actions/workflows/tests.yml/badge.svg)](https://github.com/nati2126/MiniTor/actions/workflows/tests.yml)
+[![codecov](https://codecov.io/gh/nati2126/MiniTor/graph/badge.svg)](https://codecov.io/gh/nati2126/MiniTor)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
-[![Cryptography](https://img.shields.io/badge/Security-AES--GCM%2FRSA--OAEP-green.svg)](https://cryptography.io/)
-[![Docker Supported](https://img.shields.io/badge/Docker-Supported-2496ED.svg)](docker-compose.yml)
 
-MiniTor is a simplified, educational implementation of an anonymous network, directly inspired by the architecture of **Tor (The Onion Router)**.
+A small onion routing network in Python, modeled on Tor. I built it to learn how Tor works, so it follows the real design where it can: circuits built hop by hop, fixed-size cells, a signed directory, exit policies, a SOCKS proxy and `.onion` hidden services.
 
-It implements the core ideas of **onion routing**: layered hybrid encryption (RSA + AES), circuits of multiple relays, fixed-size cells, replies that travel back through the circuit, and exit policies. No single relay knows both who sent a message and where it's going.
+It is for learning only. Don't use it to hide anything real.
 
----
+![Live view of the network](docs/visualization.jpg)
 
-## 🏗️ Architecture
+## Quick start
 
-MiniTor mirrors the Tor network with four components:
-
-1. **Directory Server (`directory_server.py`)**
-   - Acts as the network consensus (like Tor's Directory Authorities).
-   - Relays register their address, port, and **RSA public key**, then keep re-registering as a heartbeat. Relays that go silent are dropped after a TTL.
-   - Clients fetch the list of active relays from it to build circuits.
-
-2. **Relay Nodes (`relay_node.py`)**
-   - Receive a fixed-size cell, peel exactly one layer of encryption, and forward the rest to the next hop.
-   - A relay only learns its role (entry, middle, or exit) from the layer it decrypts.
-   - An **exit node** either delivers the message to itself or, if its **exit policy** allows it, connects to a destination and returns the response.
-   - Replies are encrypted again at every hop on the way back to the client.
-
-3. **Client (`client.py`)**
-   - Picks a random 3-hop circuit (Entry → Middle → Exit) using a cryptographically secure RNG.
-   - Wraps the message in one layer per hop, sends it, and verifies the reply.
-   - If a relay turns out to be offline, it retries with a new circuit.
-
-4. **Echo Server (`echo_server.py`)**
-   - A demo destination for exit traffic. Its reply shows the address it saw, which is the exit relay's address and never the client's.
-
-```text
-            ┌──────────────────┐
-            │ Directory Server │ ◄── relays register + heartbeat
-            └────────▲─────────┘
-                     │ GET_RELAYS
-┌────────┐   cell  ┌─┴─────┐  cell  ┌────────┐  cell  ┌──────┐  plain  ┌─────────────┐
-│ Client │ ──────► │ Entry │ ─────► │ Middle │ ─────► │ Exit │ ──────► │ Destination │
-│        │ ◄────── │       │ ◄───── │        │ ◄───── │      │ ◄────── │ (optional)  │
-└────────┘  reply  └───────┘  reply └────────┘  reply └──────┘         └─────────────┘
+```bash
+docker compose up -d --build
 ```
 
-### Directory Structure
-```text
-.
-├── minitor/
-│   ├── crypto/
-│   │   ├── crypto_utils.py        # RSA-OAEP, AES-GCM, AES-CTR primitives
-│   │   └── onion.py               # Cell format: build/peel onions, build/open replies
-│   └── network/
-│       ├── transport.py           # Exact reads, framed JSON, threaded TCP server
-│       ├── directory_server.py    # Directory Authority
-│       ├── relay_node.py          # Relay nodes, exit policy, replay protection
-│       ├── client.py              # Circuit builder / CLI
-│       └── echo_server.py         # Demo destination
-├── tests/                         # pytest suite (unit + end-to-end)
-├── .github/workflows/tests.yml    # CI on Linux, Windows, and macOS
-├── docker-compose.yml             # Local multi-node network
-├── Dockerfile
-├── pyproject.toml
-└── requirements.txt
+This starts a directory server, 4 relays, an echo server, a hidden service, a SOCKS proxy and the live view.
+
+- Live view: http://127.0.0.1:8080/
+- Go through the network: `curl --socks5-hostname 127.0.0.1:9050 http://echo-server:7000/`
+- Hidden service address: `docker compose exec hidden-service cat /keys/hs-hostname`
+- Visit it: `curl --socks5-hostname 127.0.0.1:9050 http://<address>.onion/`
+- Interactive client: `docker compose run --rm client`
+- Stop: `docker compose down`
+
+The echo server tells you which IP connected to it. It's always the exit relay, never you.
+
+## Running without Docker
+
+```bash
+python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -e ".[dev]"
 ```
 
----
+Start each of these in its own terminal:
 
-## 🛡️ How the Security Works (The "Onion")
-
-MiniTor uses **hybrid encryption**. RSA-2048 (OAEP/SHA-256) protects small per-hop session keys, and AES-256 encrypts the actual data.
-
-### Building the onion
-
-1. **Circuit building:** The client picks 3 relays: N1 (Entry), N2 (Middle), and N3 (Exit).
-2. **Layer 3 (Exit):** The client generates fresh keys for N3 and encrypts `EXIT | destination | message` with AES-GCM. It encrypts the keys with N3's RSA public key.
-3. **Layer 2 (Middle):** The client prepends `RELAY | address of N3` to layer 3, encrypts everything with N2's fresh keys, and encrypts those keys with N2's public key.
-4. **Layer 1 (Entry):** It does the same for N1, pointing to N2.
-5. The result is padded with random bytes to a fixed **4096-byte cell** and sent to N1.
-
-### Cell format
-
-Every packet on every link is exactly `CELL_SIZE` (4096) bytes, in both directions:
-
-```text
-┌──────────────────────────────┬────────────────────────────────────┬────────────────┐
-│ RSA-OAEP(relay public key,   │ AES-256-GCM(forward key,           │ random padding │
-│   forward key ‖ backward key │   command ‖ next address ‖ inner)  │                │
-│   ‖ layer length)   256 B    │   nonce ‖ ciphertext ‖ tag         │                │
-└──────────────────────────────┴────────────────────────────────────┴────────────────┘
+```bash
+minitor-directory --write-pubkey dir.pub
+minitor-echo --port 7000
+minitor-relay --port 8001 --dir-key @dir.pub --allow-exit 127.0.0.1:7000
+minitor-relay --port 8002 --dir-key @dir.pub --allow-exit 127.0.0.1:7000
+minitor-relay --port 8003 --dir-key @dir.pub --allow-exit 127.0.0.1:7000
+minitor-hs --dir-key @dir.pub --port 80:127.0.0.1:7000      # optional hidden service
+minitor-viz                                                  # optional, add --viz 127.0.0.1:9999 to the others
 ```
 
-When N1 receives the cell, it:
-1. decrypts the RSA block to get its two session keys and the real length of its layer,
-2. decrypts and **authenticates** its layer with AES-GCM. Any tampering is detected here and the cell is dropped,
-3. finds the routing instruction ("forward to N2"),
-4. pads the inner layer back up to 4096 bytes with random data and forwards it.
+Then:
 
-N1 knows who the client is but not the destination. N3 sees the message (and destination) but only knows it came from N2. Because every cell is the same size, someone watching the network can't tell a relay's position from packet sizes.
+```bash
+minitor-client --dir-key @dir.pub -m "hello"                          # message to an exit relay
+minitor-client --dir-key @dir.pub --dest 127.0.0.1:7000 -m "who am I"  # through an exit to a server
+minitor-client --dir-key @dir.pub --socks-port 9050                    # SOCKS5 proxy
+```
 
-### Replies
+Every command has `--help`.
 
-Each hop's RSA block also carries a **backward key**:
+## How it works
 
-1. The exit builds a fixed-size reply (`status ‖ length ‖ data ‖ padding`) and encrypts it with AES-GCM under its backward key.
-2. Each relay on the way back adds its own AES-CTR layer, which doesn't change the size.
-3. The client removes the CTR layers, then checks the exit's GCM tag, so tampering anywhere on the return path is detected.
+**Directory.** Each relay has an Ed25519 identity key and an X25519 onion key. It publishes a signed descriptor (address, keys, exit policy) to the directory and keeps refreshing it. The directory signs the list of live relays. Clients and relays check that signature against a key they pin with `--dir-key`.
 
-### Other protections
-- **Replay protection:** relays remember recently seen cells and drop duplicates, so an attacker can't replay a captured cell to find out where it goes.
-- **Exit policies:** exit nodes refuse to connect anywhere unless it's explicitly allowed (`--allow-exit host:port`), so relays aren't open proxies.
-- **Input validation:** the directory rejects malformed registrations and invalid keys; all TCP reads are length-checked, with timeouts.
+**Circuits.** The client picks 3 random relays and builds the circuit one hop at a time. It does an ntor handshake with the first relay, then asks that relay to extend to the second, and so on. Each hop ends up with its own keys, and the handshake keys are thrown away afterwards, so recorded traffic can't be decrypted later.
 
----
+**Cells.** Everything on the wire is a 512-byte cell. The client encrypts each message once per hop (AES-CTR). Each relay removes one layer and checks a MAC to see if the message is meant for it. If not, it passes the cell on. If a relay changes a cell, the MAC check fails and the circuit is closed.
 
-## 🚀 Quick Start (Docker)
+**Streams.** A circuit stays open and carries many TCP streams to different destinations. Data is split across cells, and SENDME messages limit how much can be in flight, like in Tor.
 
-Docker Compose starts a Directory Server, 3 Relay Nodes, and the Echo Server.
+**Exit policies.** An exit only connects where its `--allow-exit` rules allow. Wildcard rules like `*:80` never reach private addresses such as 127.0.0.1.
 
-1. **Start the network**
-   ```bash
-   docker compose up -d --build
-   ```
-2. **Watch the logs** (in a separate terminal)
-   ```bash
-   docker compose logs -f
-   ```
-3. **Run the interactive client**
-   ```bash
-   docker compose run --rm client
-   ```
-   Type a message. In the logs, the entry and middle relays each peel one layer, the exit delivers the message, and the reply travels back.
-4. **Send traffic to a destination through the exit node**
-   ```bash
-   docker compose run --rm client python -m minitor.network.client \
-       --dir-host dir-server --dest echo-server:7000 -m "Who am I?"
-   ```
-   The echo server replies with the IP it saw, which is the exit relay's.
-5. **Stop everything**
-   ```bash
-   docker compose down
-   ```
+**Hidden services.** A service keeps circuits open to a few introduction points and publishes their list, signed with its key. The `.onion` address is that key. A client picks a rendezvous relay and sends the service an encrypted introduction. The service then builds its own circuit to the rendezvous relay. Neither side learns the other's IP.
 
-## 🛠️ Local Development (Manual Setup)
+**Live view.** With `--viz`, each node reports the links it has open and the cells it sends. The page combines all of them. Watching every link at once like this is exactly the attack Tor can't stop.
 
-1. Create a virtual environment and install MiniTor with its dev dependencies:
-   ```bash
-   python -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
-   pip install -e ".[dev]"
-   ```
-2. Start the Directory Server and the demo destination:
-   ```bash
-   minitor-directory
-   minitor-echo --port 7000
-   ```
-3. Start 3 Relay Nodes in separate terminals (they retry until the directory is up):
-   ```bash
-   minitor-relay --port 8001 --allow-exit 127.0.0.1:7000
-   minitor-relay --port 8002 --allow-exit 127.0.0.1:7000
-   minitor-relay --port 8003 --allow-exit 127.0.0.1:7000
-   ```
-4. Run the client:
-   ```bash
-   minitor-client                                        # interactive
-   minitor-client -m "Hello onion"                       # one message
-   minitor-client --dest 127.0.0.1:7000 -m "Who am I?"   # via the exit to the echo server
-   ```
+## Limitations
 
-The `python -m minitor.network.<module>` form works too, if you don't want to install the package.
+- An attacker who watches traffic at both ends (or everywhere) can match timing. Tor has the same problem.
+- Links between nodes are plain TCP, not TLS.
+- There is one directory server, and anyone can register relays.
+- The client picks a new random entry relay every time. Tor uses fixed entry guards.
+- An exit relay can read traffic that isn't encrypted end to end. Use HTTPS.
 
-### Command-line options
-
-| Command | Useful options |
-|---|---|
-| `minitor-directory` | `--host`, `--port` (8000), `--relay-ttl` (30s), `-v` |
-| `minitor-relay` | `--port` (8001), `--dir-host`, `--dir-port`, `--public-host`, `--allow-exit HOST:PORT` (repeatable, `HOST:*` allowed), `-v` |
-| `minitor-client` | `--dir-host`, `--dir-port`, `--hops` (3), `--dest HOST:PORT`, `-m MESSAGE`, `--timeout`, `-v` |
-| `minitor-echo` | `--host`, `--port` (7000) |
-
-## 🧪 Running the Tests
+## Tests
 
 ```bash
 pytest
+ruff check . && mypy
 ```
 
-The suite covers the crypto primitives, the cell format (including tampering, wrong keys, size limits, and replies), TCP framing, the directory server (heartbeats, expiry, validation), and end-to-end runs of a real network on local ports (replies, exit policy, replay protection, and circuit retry when a relay is down). CI runs it on Linux, Windows, and macOS.
+The tests start real relays, clients and hidden services on local ports. CI runs them on Linux, Windows and macOS, and also starts the Docker setup and checks it.
 
----
+## License
 
-## ⚖️ License
-MIT License. Feel free to fork, expand
+MIT
