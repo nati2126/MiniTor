@@ -1,46 +1,100 @@
-# Starts a directory server, three relays, and a demo destination:
+# A complete MiniTor network:
 #   docker compose up -d --build
-#   docker compose run --rm client
+#   open http://127.0.0.1:8080/                                    (live visualization)
+#   curl --socks5-hostname 127.0.0.1:9050 http://echo-server:7000/  (browse through MiniTor)
+#   docker compose run --rm client                                  (interactive client)
+#
+# The directory writes its public key to the shared "keys" volume; every other
+# node pins it with --dir-key @/keys/directory.pub, so a fake directory would be
+# rejected. Ports are only published on 127.0.0.1.
+
+x-node: &node
+  build: .
+  volumes:
+    - keys:/keys
+  restart: unless-stopped
+
+x-relay: &relay
+  <<: *node
+  depends_on:
+    - dir-server
+
 services:
   dir-server:
-    build: .
-    command: python -m minitor.network.directory_server --port 8000
-    ports:
-      - "8000:8000"
-
-  relay-1: &relay
-    build: .
+    <<: *node
     command: >-
-      python -m minitor.network.relay_node --port 8001
-      --dir-host dir-server --public-host relay-1 --allow-exit echo-server:7000
-    depends_on:
-      - dir-server
-    restart: unless-stopped
+      python -m minitor.network.directory_server --port 8000
+      --key-file /keys/directory.key --write-pubkey /keys/directory.pub
+
+  relay-1:
+    <<: *relay
+    command: >-
+      python -m minitor.network.relay_node --port 8001 --public-host relay-1
+      --dir-host dir-server --dir-key @/keys/directory.pub --key-file /keys/relay-1.key
+      --allow-exit echo-server:7000 --viz viz:9999
 
   relay-2:
     <<: *relay
     command: >-
-      python -m minitor.network.relay_node --port 8002
-      --dir-host dir-server --public-host relay-2 --allow-exit echo-server:7000
+      python -m minitor.network.relay_node --port 8002 --public-host relay-2
+      --dir-host dir-server --dir-key @/keys/directory.pub --key-file /keys/relay-2.key
+      --allow-exit echo-server:7000 --viz viz:9999
 
   relay-3:
     <<: *relay
     command: >-
-      python -m minitor.network.relay_node --port 8003
-      --dir-host dir-server --public-host relay-3 --allow-exit echo-server:7000
+      python -m minitor.network.relay_node --port 8003 --public-host relay-3
+      --dir-host dir-server --dir-key @/keys/directory.pub --key-file /keys/relay-3.key
+      --allow-exit echo-server:7000 --viz viz:9999
+
+  relay-4:
+    <<: *relay
+    command: >-
+      python -m minitor.network.relay_node --port 8004 --public-host relay-4
+      --dir-host dir-server --dir-key @/keys/directory.pub --key-file /keys/relay-4.key
+      --viz viz:9999
 
   # A destination for exit traffic. Its replies show that it only ever sees an exit relay's address.
   echo-server:
-    build: .
+    <<: *node
     command: python -m minitor.network.echo_server --port 7000
+
+  # A hidden service: port 80 of its .onion address is served by the echo server.
+  # Its address: docker compose exec hidden-service cat /keys/hs-hostname
+  hidden-service:
+    <<: *relay
+    command: >-
+      python -m minitor.network.hidden_service --dir-host dir-server --dir-key @/keys/directory.pub
+      --port 80:echo-server:7000 --key-file /keys/hs.key --hostname-file /keys/hs-hostname --viz viz:9999
+
+  # SOCKS5 proxy for programs on the host.
+  socks:
+    <<: *relay
+    command: >-
+      python -m minitor.network.client --dir-host dir-server --dir-key @/keys/directory.pub
+      --socks-host 0.0.0.0 --socks-port 9050 --viz viz:9999
+    ports:
+      - "127.0.0.1:9050:9050"
+
+  # Live visualization of every link and cell.
+  viz:
+    <<: *node
+    command: python -m minitor.viz.server --host 0.0.0.0 --port 8080 --udp-port 9999
+    ports:
+      - "127.0.0.1:8080:8080"
 
   # Interactive client. Only runs on demand: docker compose run --rm client
   client:
-    build: .
-    command: python -m minitor.network.client --dir-host dir-server
+    <<: *node
+    restart: "no"
+    command: >-
+      python -m minitor.network.client --dir-host dir-server --dir-key @/keys/directory.pub --viz viz:9999
     stdin_open: true
     tty: true
     profiles:
       - client
     depends_on:
       - dir-server
+
+volumes:
+  keys:

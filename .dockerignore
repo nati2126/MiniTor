@@ -6,3 +6,6 @@
 venv
 .venv
 tests
+docs
+.ruff_cache
+.mypy_cache
