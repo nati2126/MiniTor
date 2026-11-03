@@ -55,7 +55,10 @@ def test_server_serves_page_and_receives_events():
         assert b"MiniTor Live" in page
 
         emitter = EventEmitter("relay-a", "relay", ("127.0.0.1", server.udp_port))
-        a, b = socket.socketpair()
+        # A real TCP link: socketpair() gives Unix-domain sockets on Linux and macOS.
+        with socket.create_server(("127.0.0.1", 0)) as listener:
+            a = socket.create_connection(listener.getsockname()[:2])
+            b, _ = listener.accept()
         with a, b:
             emitter.link_opened(a)
             deadline = time.time() + 5
@@ -70,6 +73,25 @@ def test_server_serves_page_and_receives_events():
         assert json.loads(line[6:])["type"] == "snapshot"
     finally:
         server.stop()
+
+
+class UnixLikeSocket:
+    """Unnamed Unix-domain sockets report their address as an empty string."""
+
+    def getsockname(self):
+        return ""
+
+    def getpeername(self):
+        return ""
+
+
+def test_link_opened_ignores_non_ip_sockets():
+    emitter = EventEmitter("relay-a", "relay", ("127.0.0.1", 9))
+    try:
+        emitter.link_opened(UnixLikeSocket())  # must not raise
+        assert emitter._links == {}
+    finally:
+        emitter.close()
 
 
 def test_disabled_emitter_sends_nothing():

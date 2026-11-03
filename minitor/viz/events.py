@@ -26,10 +26,13 @@ HEARTBEAT_INTERVAL = 5.0
 
 def _sockname(sock: socket.socket, peer: bool) -> str | None:
     try:
-        host, port = (sock.getpeername() if peer else sock.getsockname())[:2]
+        address = sock.getpeername() if peer else sock.getsockname()
     except OSError:
         return None
-    return f"{host}:{port}"
+    # Only IP sockets have a (host, port) address; Unix-domain sockets give a string.
+    if not isinstance(address, tuple) or len(address) < 2:
+        return None
+    return f"{address[0]}:{address[1]}"
 
 
 class EventEmitter:
